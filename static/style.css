@@ -81,6 +81,21 @@ main {
     box-shadow: 0 5px 15px rgba(244, 67, 54, 0.4);
 }
 
+.btn-tertiary {
+    background: linear-gradient(45deg, #9C27B0, #7B1FA2);
+    color: white;
+}
+
+.btn-tertiary:hover:not(:disabled) {
+    transform: translateY(-2px);
+    box-shadow: 0 5px 15px rgba(156, 39, 176, 0.4);
+}
+
+.btn-tertiary.active {
+    background: linear-gradient(45deg, #E91E63, #C2185B);
+    animation: pulse 2s infinite;
+}
+
 .btn:disabled {
     opacity: 0.6;
     cursor: not-allowed;
