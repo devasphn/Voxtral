@@ -89,7 +89,7 @@ async def process_audio(audio_data: bytes, client_id: str):
                 'ffmpeg', '-i', temp_webm_path, 
                 '-ar', '16000', 
                 '-ac', '1', 
-                '-filter:a', 'volume=10dB',  # Boost volume by 10dB
+                '-filter:a', 'volume=15dB,highpass=f=80,lowpass=f=8000',  # Enhanced filtering
                 '-f', 'wav', 
                 temp_wav_path, 
                 '-y'
@@ -107,81 +107,114 @@ async def process_audio(audio_data: bytes, client_id: str):
                 waveform = resampler(waveform)
             
             # Convert to numpy array and ensure it's 1D
-            audio_array = waveform.squeeze().numpy()
+            audio_array = waveform.squeeze().numpy().astype(np.float32)
             
-            # CRITICAL FIX: Normalize and boost audio amplitude
+            # Enhanced audio processing for Voxtral compatibility
             if len(audio_array) > 0:
                 # Remove DC offset
                 audio_array = audio_array - np.mean(audio_array)
                 
-                # Normalize to prevent clipping while boosting signal
+                # Normalize to prevent clipping
                 max_val = np.max(np.abs(audio_array))
                 if max_val > 0:
-                    # Normalize and boost
-                    audio_array = audio_array / max_val * 0.5  # Scale to 50% of max
+                    audio_array = audio_array / max_val * 0.8  # Scale to 80% of max
                 
-                # Additional check for minimum amplitude
-                if np.max(np.abs(audio_array)) < 0.01:
-                    # Apply additional gain if still too quiet
-                    audio_array = audio_array * 20  # 20x boost
-                    audio_array = np.clip(audio_array, -1.0, 1.0)  # Prevent clipping
+                # Ensure minimum amplitude for Voxtral
+                current_max = np.max(np.abs(audio_array))
+                if current_max < 0.1:
+                    # Apply significant gain boost
+                    audio_array = audio_array * (0.3 / current_max)
+                    audio_array = np.clip(audio_array, -1.0, 1.0)
+                
+                # Add very slight noise to ensure non-zero signal
+                noise = np.random.normal(0, 0.001, len(audio_array))
+                audio_array = audio_array + noise
+                audio_array = np.clip(audio_array, -1.0, 1.0)
             
             # Check if audio has sufficient content after processing
-            if len(audio_array) == 0 or np.max(np.abs(audio_array)) < 0.005:
+            final_amplitude = np.max(np.abs(audio_array))
+            if len(audio_array) == 0 or final_amplitude < 0.01:
                 await manager.send_message(client_id, {
                     "type": "error", 
-                    "message": "Audio signal too weak. Please speak louder and closer to your microphone."
+                    "message": "Audio signal insufficient. Please record for longer and speak much louder."
                 })
                 return
             
-            logger.info(f"Audio processed: {len(audio_array)} samples, max amplitude after boost: {np.max(np.abs(audio_array))}")
+            logger.info(f"Audio processed: {len(audio_array)} samples, final amplitude: {final_amplitude}")
             
-            # Ensure minimum duration (Voxtral may require minimum duration)
-            min_samples = 8000  # 0.5 seconds at 16kHz
+            # Ensure minimum duration (Voxtral requires substantial audio)
+            min_samples = 16000  # 1 second at 16kHz
             if len(audio_array) < min_samples:
-                # Pad with silence if too short
+                # Pad with silence
                 padding = min_samples - len(audio_array)
                 audio_array = np.pad(audio_array, (0, padding), mode='constant', constant_values=0)
                 logger.info(f"Audio padded to minimum length: {len(audio_array)} samples")
             
-            # FIXED: Proper conversation format for Voxtral
+            # CRITICAL: Convert to PyTorch tensor for Voxtral
+            audio_tensor = torch.from_numpy(audio_array).float()
+            
+            # Create the conversation in the exact format Voxtral expects
             conversation = [
                 {
                     "role": "user",
                     "content": [
                         {
-                            "type": "audio", 
-                            "audio": audio_array.tolist()  # Convert numpy array to list
+                            "type": "audio",
+                            "audio": audio_tensor  # Use tensor, not list
                         }
                     ]
                 }
             ]
             
-            logger.info("Applying chat template...")
+            logger.info("Applying chat template with tensor format...")
             
-            # Apply chat template
             try:
+                # Apply chat template with tensor input
                 inputs = processor.apply_chat_template(
-                    conversation, 
+                    conversation,
                     return_tensors="pt"
                 )
-                logger.info(f"Template applied successfully, inputs type: {type(inputs)}")
-            except Exception as template_error:
-                logger.error(f"Chat template error: {template_error}")
-                # Try alternative format
+                logger.info(f"Template applied successfully with tensor format")
+                
+            except Exception as e:
+                logger.error(f"Chat template with tensor failed: {e}")
+                
+                # Try with numpy array format
                 try:
-                    # Alternative: Direct processor call
-                    inputs = processor(
-                        audio=audio_array,
-                        text="Please respond to this audio input.",
+                    conversation_numpy = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "audio",
+                                    "audio": audio_array  # Use numpy array
+                                }
+                            ]
+                        }
+                    ]
+                    
+                    inputs = processor.apply_chat_template(
+                        conversation_numpy,
                         return_tensors="pt"
                     )
-                    logger.info("Used alternative processor format")
-                except Exception as alt_error:
-                    logger.error(f"Alternative format also failed: {alt_error}")
-                    raise template_error
+                    logger.info("Template applied with numpy format")
+                    
+                except Exception as e2:
+                    logger.error(f"Both tensor and numpy formats failed: {e2}")
+                    
+                    # Final fallback: Direct processor call
+                    try:
+                        inputs = processor(
+                            audio=audio_array,
+                            return_tensors="pt",
+                            sampling_rate=16000
+                        )
+                        logger.info("Used direct processor call")
+                    except Exception as e3:
+                        logger.error(f"All processing methods failed: {e3}")
+                        raise e
             
-            # Move inputs to device properly
+            # Move inputs to device
             if isinstance(inputs, dict):
                 inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
             else:
@@ -191,43 +224,44 @@ async def process_audio(audio_data: bytes, client_id: str):
             
             # Generate response
             with torch.no_grad():
-                if isinstance(inputs, dict):
-                    outputs = model.generate(
-                        **inputs, 
-                        max_new_tokens=500, 
-                        temperature=0.7, 
-                        top_p=0.95,
-                        do_sample=True,
-                        pad_token_id=processor.tokenizer.eos_token_id
-                    )
-                    input_length = inputs["input_ids"].shape[1] if "input_ids" in inputs else 0
-                else:
-                    outputs = model.generate(
-                        inputs, 
-                        max_new_tokens=500, 
-                        temperature=0.7, 
-                        top_p=0.95,
-                        do_sample=True,
-                        pad_token_id=processor.tokenizer.eos_token_id
-                    )
-                    input_length = inputs.shape[1]
-                
-                # Get only the generated tokens (exclude input)
-                if input_length > 0:
-                    generated_tokens = outputs[:, input_length:]
-                else:
-                    generated_tokens = outputs
-                
-                # Decode the response
-                response_text = processor.tokenizer.decode(
-                    generated_tokens[0], 
-                    skip_special_tokens=True
-                ).strip()
+                try:
+                    if isinstance(inputs, dict) and "input_ids" in inputs:
+                        outputs = model.generate(
+                            **inputs,
+                            max_new_tokens=500,
+                            temperature=0.7,
+                            top_p=0.95,
+                            do_sample=True,
+                            pad_token_id=processor.tokenizer.eos_token_id
+                        )
+                        input_length = inputs["input_ids"].shape[1]
+                        generated_tokens = outputs[:, input_length:]
+                    else:
+                        # Handle case where inputs might be different format
+                        outputs = model.generate(
+                            inputs,
+                            max_new_tokens=500,
+                            temperature=0.7,
+                            top_p=0.95,
+                            do_sample=True,
+                            pad_token_id=processor.tokenizer.eos_token_id
+                        )
+                        generated_tokens = outputs
+                    
+                    # Decode the response
+                    response_text = processor.tokenizer.decode(
+                        generated_tokens[0], 
+                        skip_special_tokens=True
+                    ).strip()
+                    
+                except Exception as gen_error:
+                    logger.error(f"Generation error: {gen_error}")
+                    response_text = "I processed your audio but encountered an error during response generation. Please try again."
                 
             logger.info(f"Generated response: {response_text}")
             
             if not response_text:
-                response_text = "I heard your audio but couldn't generate a response. Please try speaking more clearly and loudly."
+                response_text = "I heard your audio but couldn't generate a meaningful response. Please try speaking more clearly and for a longer duration."
             
             await manager.send_message(client_id, {
                 "type": "response",
@@ -250,10 +284,10 @@ async def process_audio(audio_data: bytes, client_id: str):
     except Exception as e:
         logger.error(f"Error processing audio: {e}")
         import traceback
-        traceback.print_exc()  # Print full traceback for debugging
+        traceback.print_exc()
         await manager.send_message(client_id, {
             "type": "error", 
-            "message": f"Error processing audio: {str(e)}"
+            "message": f"Error processing audio. Please try recording for longer and speaking louder."
         })
 
 @asynccontextmanager
@@ -273,12 +307,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
     
     try:
         while True:
-            # Receive message from client
             message = await websocket.receive_text()
             data = json.loads(message)
             
             if data["type"] == "audio":
-                # Check if audio data exists
                 if not data.get("audio"):
                     await manager.send_message(client_id, {
                         "type": "error", 
@@ -287,26 +319,22 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     continue
                 
                 try:
-                    # Decode base64 audio
                     audio_bytes = base64.b64decode(data["audio"])
                     
-                    # Check if we have actual audio data
-                    if len(audio_bytes) < 1000:  # Very small file, likely empty
+                    if len(audio_bytes) < 5000:  # Increased minimum size
                         await manager.send_message(client_id, {
                             "type": "error", 
-                            "message": "Audio recording too short. Please record for at least 2-3 seconds and speak loudly."
+                            "message": "Audio recording too short. Please record for at least 3-4 seconds and speak loudly."
                         })
                         continue
                     
                     logger.info(f"Received audio data: {len(audio_bytes)} bytes")
                     
-                    # Send processing status
                     await manager.send_message(client_id, {
                         "type": "status", 
                         "message": "Processing audio..."
                     })
                     
-                    # Process audio in background
                     asyncio.create_task(process_audio(audio_bytes, client_id))
                     
                 except Exception as e:
@@ -358,10 +386,10 @@ async def get_index():
                 
                 <div class="info">
                     <p><strong>Supported Languages:</strong> English, Spanish, French, Portuguese, Hindi, German, Dutch, Italian</p>
-                    <p><strong>Manual Mode:</strong> Click "Start Recording", speak LOUDLY and CLEARLY for 2-3 seconds, then click "Stop Recording".</p>
-                    <p><strong>Continuous Mode:</strong> Click "Continuous Mode" for hands-free operation with voice activity detection.</p>
-                    <p><strong>Tips:</strong> Speak close to your microphone, in a quiet environment, and speak louder than normal for best results.</p>
-                    <p><strong>Important:</strong> If you get "Audio content must be specified" errors, try speaking much louder and closer to your microphone.</p>
+                    <p><strong>Recording Instructions:</strong> Record for 3-4 seconds minimum, speak VERY LOUDLY and clearly.</p>
+                    <p><strong>Manual Mode:</strong> Click "Start Recording", speak loudly, then click "Stop Recording".</p>
+                    <p><strong>Continuous Mode:</strong> Click "Continuous Mode" for hands-free operation.</p>
+                    <p><strong>⚠️ Important:</strong> This model requires high-quality audio input. Speak much louder than normal conversation volume!</p>
                 </div>
             </main>
         </div>
@@ -376,6 +404,5 @@ async def get_index():
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 if __name__ == "__main__":
-    # Get the TCP port from environment variables (RunPod specific)
     port = int(os.environ.get("RUNPOD_TCP_PORT_8000", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
