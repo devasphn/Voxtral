@@ -8,23 +8,22 @@ from typing import Dict, Optional
 import uuid
 import tempfile
 import os
+import numpy as np
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 import uvicorn
+from contextlib import asynccontextmanager
 
 # Voxtral imports
 from transformers import VoxtralForConditionalGeneration, AutoProcessor
 import torch
 import torchaudio
-import numpy as np
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-app = FastAPI(title="Voxtral Audio Chat", version="1.0.0")
 
 # Global model variables
 model = None
@@ -63,7 +62,7 @@ async def load_model():
         model = VoxtralForConditionalGeneration.from_pretrained(
             repo_id, 
             torch_dtype=torch.bfloat16, 
-            device_map=device
+            device_map="auto"
         )
         
         logger.info(f"Model loaded successfully on {device}")
@@ -72,49 +71,108 @@ async def load_model():
         logger.error(f"Failed to load model: {e}")
         return False
 
-async def process_audio(audio_data: bytes, client_id: str, mode: str = "chat"):
+async def process_audio(audio_data: bytes, client_id: str):
     """Process audio data and return response"""
     try:
         # Convert audio bytes to temporary file
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+        with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as temp_file:
             temp_file.write(audio_data)
-            temp_file_path = temp_file.name
+            temp_webm_path = temp_file.name
+        
+        # Convert WebM to WAV using FFmpeg via torchaudio
+        temp_wav_path = temp_webm_path.replace('.webm', '.wav')
         
         try:
-            # Load audio
-            waveform, sample_rate = torchaudio.load(temp_file_path)
+            # Use ffmpeg to convert webm to wav
+            import subprocess
+            subprocess.run([
+                'ffmpeg', '-i', temp_webm_path, 
+                '-ar', '16000', 
+                '-ac', '1', 
+                '-f', 'wav', 
+                temp_wav_path, 
+                '-y'
+            ], check=True, capture_output=True)
             
-            # Ensure mono audio
+            # Load the converted WAV file
+            waveform, sample_rate = torchaudio.load(temp_wav_path)
+            
+            # Ensure mono and correct sample rate
             if waveform.shape[0] > 1:
                 waveform = torch.mean(waveform, dim=0, keepdim=True)
             
-            # Resample if needed (Voxtral expects 16kHz)
             if sample_rate != 16000:
                 resampler = torchaudio.transforms.Resample(sample_rate, 16000)
                 waveform = resampler(waveform)
             
-            # Prepare conversation for the model
+            # Convert to numpy array and ensure it's 1D
+            audio_array = waveform.squeeze().numpy()
+            
+            # Check if audio has content
+            if len(audio_array) == 0 or np.all(audio_array == 0):
+                await manager.send_message(client_id, {
+                    "type": "error", 
+                    "message": "No audio content detected. Please speak louder or check your microphone."
+                })
+                return
+            
+            # Prepare conversation for Voxtral
             conversation = [{
                 "role": "user",
                 "content": [{
                     "type": "audio",
-                    "audio": waveform.numpy().flatten()
+                    "audio": audio_array.tolist()  # Convert to list for JSON serialization
                 }]
             }]
             
-            # Process with model
-            inputs = processor.apply_chat_template(conversation)
-            inputs = inputs.to(device, dtype=torch.bfloat16)
+            # Apply chat template
+            inputs = processor.apply_chat_template(
+                conversation, 
+                return_tensors="pt"
+            )
+            
+            # Move to correct device
+            if isinstance(inputs, dict):
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+            else:
+                inputs = inputs.to(device)
             
             # Generate response
             with torch.no_grad():
-                outputs = model.generate(**inputs, max_new_tokens=500, temperature=0.2, top_p=0.95)
-                decoded_outputs = processor.batch_decode(
-                    outputs[:, inputs.input_ids.shape[1]:], 
+                if isinstance(inputs, dict):
+                    outputs = model.generate(
+                        **inputs, 
+                        max_new_tokens=500, 
+                        temperature=0.7, 
+                        top_p=0.95,
+                        do_sample=True,
+                        pad_token_id=processor.tokenizer.eos_token_id
+                    )
+                    input_length = inputs["input_ids"].shape[1]
+                else:
+                    outputs = model.generate(
+                        inputs, 
+                        max_new_tokens=500, 
+                        temperature=0.7, 
+                        top_p=0.95,
+                        do_sample=True,
+                        pad_token_id=processor.tokenizer.eos_token_id
+                    )
+                    input_length = inputs.shape[1]
+                
+                # Decode only the new tokens
+                new_tokens = outputs[:, input_length:]
+                decoded_outputs = processor.tokenizer.batch_decode(
+                    new_tokens, 
                     skip_special_tokens=True
                 )
             
-            response_text = decoded_outputs[0] if decoded_outputs else "Sorry, I couldn't process that audio."
+            response_text = decoded_outputs[0] if decoded_outputs else "I'm sorry, I couldn't process that audio. Could you please try again?"
+            
+            # Clean up response text
+            response_text = response_text.strip()
+            if not response_text:
+                response_text = "I heard your audio but couldn't generate a response. Please try speaking more clearly."
             
             await manager.send_message(client_id, {
                 "type": "response",
@@ -123,10 +181,17 @@ async def process_audio(audio_data: bytes, client_id: str, mode: str = "chat"):
             })
             
         finally:
-            # Clean up temp file
-            if os.path.exists(temp_file_path):
-                os.unlink(temp_file_path)
-                
+            # Clean up temp files
+            for path in [temp_webm_path, temp_wav_path]:
+                if os.path.exists(path):
+                    os.unlink(path)
+                    
+    except subprocess.CalledProcessError as e:
+        logger.error(f"FFmpeg conversion error: {e}")
+        await manager.send_message(client_id, {
+            "type": "error", 
+            "message": "Audio format conversion failed. Please try again."
+        })
     except Exception as e:
         logger.error(f"Error processing audio: {e}")
         await manager.send_message(client_id, {
@@ -134,12 +199,16 @@ async def process_audio(audio_data: bytes, client_id: str, mode: str = "chat"):
             "message": f"Error processing audio: {str(e)}"
         })
 
-@app.on_event("startup")
-async def startup_event():
-    """Load model on startup"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
     success = await load_model()
     if not success:
         logger.error("Failed to load model on startup")
+    yield
+    # Shutdown (if needed)
+
+app = FastAPI(title="Voxtral Audio Chat", version="1.0.0", lifespan=lifespan)
 
 @app.websocket("/ws/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
@@ -152,17 +221,41 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
             data = json.loads(message)
             
             if data["type"] == "audio":
-                # Decode base64 audio
-                audio_bytes = base64.b64decode(data["audio"])
+                # Check if audio data exists
+                if not data.get("audio"):
+                    await manager.send_message(client_id, {
+                        "type": "error", 
+                        "message": "No audio data received"
+                    })
+                    continue
                 
-                # Send processing status
-                await manager.send_message(client_id, {
-                    "type": "status", 
-                    "message": "Processing audio..."
-                })
-                
-                # Process audio in background
-                asyncio.create_task(process_audio(audio_bytes, client_id))
+                try:
+                    # Decode base64 audio
+                    audio_bytes = base64.b64decode(data["audio"])
+                    
+                    # Check if we have actual audio data
+                    if len(audio_bytes) < 1000:  # Very small file, likely empty
+                        await manager.send_message(client_id, {
+                            "type": "error", 
+                            "message": "Audio recording too short. Please record for at least 1 second."
+                        })
+                        continue
+                    
+                    # Send processing status
+                    await manager.send_message(client_id, {
+                        "type": "status", 
+                        "message": "Processing audio..."
+                    })
+                    
+                    # Process audio in background
+                    asyncio.create_task(process_audio(audio_bytes, client_id))
+                    
+                except Exception as e:
+                    logger.error(f"Error decoding audio: {e}")
+                    await manager.send_message(client_id, {
+                        "type": "error", 
+                        "message": "Failed to decode audio data"
+                    })
                 
             elif data["type"] == "ping":
                 await manager.send_message(client_id, {"type": "pong"})
@@ -205,7 +298,8 @@ async def get_index():
                 
                 <div class="info">
                     <p><strong>Supported Languages:</strong> English, Spanish, French, Portuguese, Hindi, German, Dutch, Italian</p>
-                    <p><strong>Instructions:</strong> Click "Start Recording" to begin. Speak clearly and click "Stop Recording" when done.</p>
+                    <p><strong>Instructions:</strong> Click "Start Recording" to begin. Speak clearly for at least 2-3 seconds, then click "Stop Recording".</p>
+                    <p><strong>Tips:</strong> Ensure your microphone is working and speak in a quiet environment for best results.</p>
                 </div>
             </main>
         </div>
