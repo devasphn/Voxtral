@@ -83,12 +83,13 @@ async def process_audio(audio_data: bytes, client_id: str):
         temp_wav_path = temp_webm_path.replace('.webm', '.wav')
         
         try:
-            # Use ffmpeg to convert webm to wav
+            # Use ffmpeg to convert webm to wav with normalization
             import subprocess
             result = subprocess.run([
                 'ffmpeg', '-i', temp_webm_path, 
                 '-ar', '16000', 
                 '-ac', '1', 
+                '-filter:a', 'volume=10dB',  # Boost volume by 10dB
                 '-f', 'wav', 
                 temp_wav_path, 
                 '-y'
@@ -108,17 +109,42 @@ async def process_audio(audio_data: bytes, client_id: str):
             # Convert to numpy array and ensure it's 1D
             audio_array = waveform.squeeze().numpy()
             
-            # Check if audio has content
-            if len(audio_array) == 0 or np.all(np.abs(audio_array) < 0.001):
+            # CRITICAL FIX: Normalize and boost audio amplitude
+            if len(audio_array) > 0:
+                # Remove DC offset
+                audio_array = audio_array - np.mean(audio_array)
+                
+                # Normalize to prevent clipping while boosting signal
+                max_val = np.max(np.abs(audio_array))
+                if max_val > 0:
+                    # Normalize and boost
+                    audio_array = audio_array / max_val * 0.5  # Scale to 50% of max
+                
+                # Additional check for minimum amplitude
+                if np.max(np.abs(audio_array)) < 0.01:
+                    # Apply additional gain if still too quiet
+                    audio_array = audio_array * 20  # 20x boost
+                    audio_array = np.clip(audio_array, -1.0, 1.0)  # Prevent clipping
+            
+            # Check if audio has sufficient content after processing
+            if len(audio_array) == 0 or np.max(np.abs(audio_array)) < 0.005:
                 await manager.send_message(client_id, {
                     "type": "error", 
-                    "message": "No audio content detected. Please speak louder or check your microphone."
+                    "message": "Audio signal too weak. Please speak louder and closer to your microphone."
                 })
                 return
             
-            logger.info(f"Audio processed: {len(audio_array)} samples, max amplitude: {np.max(np.abs(audio_array))}")
+            logger.info(f"Audio processed: {len(audio_array)} samples, max amplitude after boost: {np.max(np.abs(audio_array))}")
             
-            # CRITICAL FIX: Correct conversation format for Voxtral
+            # Ensure minimum duration (Voxtral may require minimum duration)
+            min_samples = 8000  # 0.5 seconds at 16kHz
+            if len(audio_array) < min_samples:
+                # Pad with silence if too short
+                padding = min_samples - len(audio_array)
+                audio_array = np.pad(audio_array, (0, padding), mode='constant', constant_values=0)
+                logger.info(f"Audio padded to minimum length: {len(audio_array)} samples")
+            
+            # FIXED: Proper conversation format for Voxtral
             conversation = [
                 {
                     "role": "user",
@@ -133,13 +159,27 @@ async def process_audio(audio_data: bytes, client_id: str):
             
             logger.info("Applying chat template...")
             
-            # Apply chat template - FIXED: Remove return_dict parameter
-            inputs = processor.apply_chat_template(
-                conversation, 
-                return_tensors="pt"
-            )
-            
-            logger.info(f"Template applied, inputs type: {type(inputs)}")
+            # Apply chat template
+            try:
+                inputs = processor.apply_chat_template(
+                    conversation, 
+                    return_tensors="pt"
+                )
+                logger.info(f"Template applied successfully, inputs type: {type(inputs)}")
+            except Exception as template_error:
+                logger.error(f"Chat template error: {template_error}")
+                # Try alternative format
+                try:
+                    # Alternative: Direct processor call
+                    inputs = processor(
+                        audio=audio_array,
+                        text="Please respond to this audio input.",
+                        return_tensors="pt"
+                    )
+                    logger.info("Used alternative processor format")
+                except Exception as alt_error:
+                    logger.error(f"Alternative format also failed: {alt_error}")
+                    raise template_error
             
             # Move inputs to device properly
             if isinstance(inputs, dict):
@@ -160,7 +200,7 @@ async def process_audio(audio_data: bytes, client_id: str):
                         do_sample=True,
                         pad_token_id=processor.tokenizer.eos_token_id
                     )
-                    input_length = inputs["input_ids"].shape[1]
+                    input_length = inputs["input_ids"].shape[1] if "input_ids" in inputs else 0
                 else:
                     outputs = model.generate(
                         inputs, 
@@ -173,7 +213,10 @@ async def process_audio(audio_data: bytes, client_id: str):
                     input_length = inputs.shape[1]
                 
                 # Get only the generated tokens (exclude input)
-                generated_tokens = outputs[:, input_length:]
+                if input_length > 0:
+                    generated_tokens = outputs[:, input_length:]
+                else:
+                    generated_tokens = outputs
                 
                 # Decode the response
                 response_text = processor.tokenizer.decode(
@@ -184,7 +227,7 @@ async def process_audio(audio_data: bytes, client_id: str):
             logger.info(f"Generated response: {response_text}")
             
             if not response_text:
-                response_text = "I heard your audio but couldn't generate a response. Please try speaking more clearly."
+                response_text = "I heard your audio but couldn't generate a response. Please try speaking more clearly and loudly."
             
             await manager.send_message(client_id, {
                 "type": "response",
@@ -251,7 +294,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     if len(audio_bytes) < 1000:  # Very small file, likely empty
                         await manager.send_message(client_id, {
                             "type": "error", 
-                            "message": "Audio recording too short. Please record for at least 1 second."
+                            "message": "Audio recording too short. Please record for at least 2-3 seconds and speak loudly."
                         })
                         continue
                     
@@ -315,9 +358,10 @@ async def get_index():
                 
                 <div class="info">
                     <p><strong>Supported Languages:</strong> English, Spanish, French, Portuguese, Hindi, German, Dutch, Italian</p>
-                    <p><strong>Manual Mode:</strong> Click "Start Recording", speak, then click "Stop Recording".</p>
+                    <p><strong>Manual Mode:</strong> Click "Start Recording", speak LOUDLY and CLEARLY for 2-3 seconds, then click "Stop Recording".</p>
                     <p><strong>Continuous Mode:</strong> Click "Continuous Mode" for hands-free operation with voice activity detection.</p>
-                    <p><strong>Tips:</strong> Ensure your microphone is working and speak in a quiet environment for best results.</p>
+                    <p><strong>Tips:</strong> Speak close to your microphone, in a quiet environment, and speak louder than normal for best results.</p>
+                    <p><strong>Important:</strong> If you get "Audio content must be specified" errors, try speaking much louder and closer to your microphone.</p>
                 </div>
             </main>
         </div>
