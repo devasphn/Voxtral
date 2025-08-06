@@ -11,6 +11,7 @@ class VoxtralChat {
         this.audioContext = null;
         this.analyser = null;
         this.dataArray = null;
+        this.stream = null;
         
         this.initializeElements();
         this.initializeWebSocket();
@@ -27,6 +28,11 @@ class VoxtralChat {
         this.continuousBtn = document.getElementById('continuousBtn');
         this.status = document.getElementById('status');
         this.messages = document.getElementById('messages');
+        
+        // Check if continuous button exists
+        if (!this.continuousBtn) {
+            console.error('Continuous button not found in HTML');
+        }
     }
     
     initializeWebSocket() {
@@ -59,7 +65,10 @@ class VoxtralChat {
     setupEventListeners() {
         this.startBtn.addEventListener('click', () => this.startRecording());
         this.stopBtn.addEventListener('click', () => this.stopRecording());
-        this.continuousBtn.addEventListener('click', () => this.toggleContinuousMode());
+        
+        if (this.continuousBtn) {
+            this.continuousBtn.addEventListener('click', () => this.toggleContinuousMode());
+        }
     }
     
     async toggleContinuousMode() {
@@ -86,7 +95,7 @@ class VoxtralChat {
     
     async startContinuousRecording() {
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({ 
+            this.stream = await navigator.mediaDevices.getUserMedia({ 
                 audio: {
                     channelCount: 1,
                     echoCancellation: true,
@@ -98,14 +107,14 @@ class VoxtralChat {
             // Setup audio context for voice activity detection
             this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
             this.analyser = this.audioContext.createAnalyser();
-            const microphone = this.audioContext.createMediaStreamSource(stream);
+            const microphone = this.audioContext.createMediaStreamSource(this.stream);
             microphone.connect(this.analyser);
             
             this.analyser.fftSize = 256;
             this.dataArray = new Uint8Array(this.analyser.frequencyBinCount);
             
             this.updateStatus('Continuous mode active - Speak anytime', 'recording');
-            this.startVoiceActivityDetection(stream);
+            this.startVoiceActivityDetection();
             
         } catch (error) {
             console.error('Error starting continuous recording:', error);
@@ -115,7 +124,7 @@ class VoxtralChat {
         }
     }
     
-    startVoiceActivityDetection(stream) {
+    startVoiceActivityDetection() {
         const checkVoiceActivity = () => {
             if (!this.isContinuousMode) return;
             
@@ -123,11 +132,11 @@ class VoxtralChat {
             const average = this.dataArray.reduce((a, b) => a + b) / this.dataArray.length;
             
             // Voice activity threshold (adjust as needed)
-            const threshold = 20;
+            const threshold = 25;
             
             if (average > threshold && !this.isRecording) {
                 // Voice detected, start recording
-                this.startAutoRecording(stream);
+                this.startAutoRecording();
             }
             
             requestAnimationFrame(checkVoiceActivity);
@@ -136,7 +145,7 @@ class VoxtralChat {
         checkVoiceActivity();
     }
     
-    async startAutoRecording(stream) {
+    async startAutoRecording() {
         if (this.isRecording) return;
         
         try {
@@ -152,7 +161,7 @@ class VoxtralChat {
                 }
             }
             
-            this.mediaRecorder = new MediaRecorder(stream, options);
+            this.mediaRecorder = new MediaRecorder(this.stream, options);
             this.audioChunks = [];
             this.recordingStartTime = Date.now();
             
@@ -201,6 +210,11 @@ class VoxtralChat {
         if (this.mediaRecorder && this.isRecording) {
             this.mediaRecorder.stop();
             this.isRecording = false;
+        }
+        
+        if (this.stream) {
+            this.stream.getTracks().forEach(track => track.stop());
+            this.stream = null;
         }
         
         if (this.audioContext) {
@@ -263,13 +277,6 @@ class VoxtralChat {
             this.startBtn.disabled = true;
             this.stopBtn.disabled = false;
             this.updateStatus('Recording... (speak now)', 'recording');
-            
-            // Auto-stop after 30 seconds to prevent too long recordings
-            setTimeout(() => {
-                if (this.isRecording && !this.isContinuousMode) {
-                    this.stopRecording();
-                }
-            }, 30000);
             
         } catch (error) {
             console.error('Error starting recording:', error);
