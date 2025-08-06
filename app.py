@@ -79,20 +79,20 @@ async def process_audio(audio_data: bytes, client_id: str):
             temp_file.write(audio_data)
             temp_webm_path = temp_file.name
         
-        # Convert WebM to WAV using FFmpeg via torchaudio
+        # Convert WebM to WAV using FFmpeg
         temp_wav_path = temp_webm_path.replace('.webm', '.wav')
         
         try:
             # Use ffmpeg to convert webm to wav
             import subprocess
-            subprocess.run([
+            result = subprocess.run([
                 'ffmpeg', '-i', temp_webm_path, 
                 '-ar', '16000', 
                 '-ac', '1', 
                 '-f', 'wav', 
                 temp_wav_path, 
                 '-y'
-            ], check=True, capture_output=True)
+            ], check=True, capture_output=True, text=True)
             
             # Load the converted WAV file
             waveform, sample_rate = torchaudio.load(temp_wav_path)
@@ -109,19 +109,21 @@ async def process_audio(audio_data: bytes, client_id: str):
             audio_array = waveform.squeeze().numpy()
             
             # Check if audio has content
-            if len(audio_array) == 0 or np.all(audio_array == 0):
+            if len(audio_array) == 0 or np.all(np.abs(audio_array) < 0.001):
                 await manager.send_message(client_id, {
                     "type": "error", 
                     "message": "No audio content detected. Please speak louder or check your microphone."
                 })
                 return
             
-            # Prepare conversation for Voxtral
+            logger.info(f"Audio processed: {len(audio_array)} samples, max amplitude: {np.max(np.abs(audio_array))}")
+            
+            # Prepare conversation for Voxtral - FIXED FORMAT
             conversation = [{
-                "role": "user",
+                "role": "user", 
                 "content": [{
                     "type": "audio",
-                    "audio": audio_array.tolist()  # Convert to list for JSON serialization
+                    "audio": audio_array
                 }]
             }]
             
@@ -167,7 +169,7 @@ async def process_audio(audio_data: bytes, client_id: str):
                     skip_special_tokens=True
                 )
             
-            response_text = decoded_outputs[0] if decoded_outputs else "I'm sorry, I couldn't process that audio. Could you please try again?"
+            response_text = decoded_outputs[0] if decoded_outputs and decoded_outputs[0].strip() else "I'm sorry, I couldn't process that audio. Could you please try again?"
             
             # Clean up response text
             response_text = response_text.strip()
@@ -241,6 +243,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         })
                         continue
                     
+                    logger.info(f"Received audio data: {len(audio_bytes)} bytes")
+                    
                     # Send processing status
                     await manager.send_message(client_id, {
                         "type": "status", 
@@ -289,6 +293,7 @@ async def get_index():
                 <div class="controls">
                     <button id="startBtn" class="btn btn-primary">🎤 Start Recording</button>
                     <button id="stopBtn" class="btn btn-secondary" disabled>⏹️ Stop Recording</button>
+                    <button id="continuousBtn" class="btn btn-tertiary">🔄 Continuous Mode</button>
                     <span id="status" class="status">Ready</span>
                 </div>
                 
@@ -298,7 +303,8 @@ async def get_index():
                 
                 <div class="info">
                     <p><strong>Supported Languages:</strong> English, Spanish, French, Portuguese, Hindi, German, Dutch, Italian</p>
-                    <p><strong>Instructions:</strong> Click "Start Recording" to begin. Speak clearly for at least 2-3 seconds, then click "Stop Recording".</p>
+                    <p><strong>Manual Mode:</strong> Click "Start Recording", speak, then click "Stop Recording".</p>
+                    <p><strong>Continuous Mode:</strong> Click "Continuous Mode" for hands-free operation with voice activity detection.</p>
                     <p><strong>Tips:</strong> Ensure your microphone is working and speak in a quiet environment for best results.</p>
                 </div>
             </main>
