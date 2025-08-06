@@ -44,6 +44,7 @@ class VoxtralChat {
         this.ws.onopen = () => {
             console.log('WebSocket connected');
             this.updateStatus('Connected - Ready to record');
+            this.addMessage('💡 Tip: Speak loudly and clearly for best results!', 'info');
         };
         
         this.ws.onmessage = (event) => {
@@ -98,9 +99,10 @@ class VoxtralChat {
             this.stream = await navigator.mediaDevices.getUserMedia({ 
                 audio: {
                     channelCount: 1,
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true
+                    echoCancellation: false,  // Disable to preserve natural volume
+                    noiseSuppression: false,  // Disable to preserve signal strength
+                    autoGainControl: false,   // Disable to prevent automatic volume reduction
+                    volume: 1.0              // Maximum volume
                 } 
             });
             
@@ -113,7 +115,8 @@ class VoxtralChat {
             this.analyser.fftSize = 256;
             this.dataArray = new Uint8Array(this.analyser.frequencyBinCount);
             
-            this.updateStatus('Continuous mode active - Speak anytime', 'recording');
+            this.updateStatus('Continuous mode active - Speak loudly', 'recording');
+            this.addMessage('🎤 Continuous mode started. Speak loudly and clearly!', 'info');
             this.startVoiceActivityDetection();
             
         } catch (error) {
@@ -131,8 +134,8 @@ class VoxtralChat {
             this.analyser.getByteFrequencyData(this.dataArray);
             const average = this.dataArray.reduce((a, b) => a + b) / this.dataArray.length;
             
-            // Voice activity threshold (adjust as needed)
-            const threshold = 25;
+            // Lower threshold for voice activity detection
+            const threshold = 20;
             
             if (average > threshold && !this.isRecording) {
                 // Voice detected, start recording
@@ -149,8 +152,11 @@ class VoxtralChat {
         if (this.isRecording) return;
         
         try {
-            // Check if the browser supports the preferred format
-            let options = { mimeType: 'audio/webm;codecs=opus' };
+            // Use higher quality settings for recording
+            let options = { 
+                mimeType: 'audio/webm;codecs=opus',
+                audioBitsPerSecond: 128000  // Higher bitrate
+            };
             if (!MediaRecorder.isTypeSupported(options.mimeType)) {
                 options = { mimeType: 'audio/webm' };
                 if (!MediaRecorder.isTypeSupported(options.mimeType)) {
@@ -178,14 +184,14 @@ class VoxtralChat {
             this.mediaRecorder.start(100);
             this.isRecording = true;
             
-            this.updateStatus('Recording detected speech...', 'recording');
+            this.updateStatus('Recording speech... (speak loudly)', 'recording');
             
-            // Auto-stop after silence or max duration
+            // Auto-stop after longer duration for better capture
             this.silenceTimer = setTimeout(() => {
                 if (this.isRecording) {
                     this.stopAutoRecording();
                 }
-            }, 5000); // Stop after 5 seconds
+            }, 6000); // Increased to 6 seconds
             
         } catch (error) {
             console.error('Error starting auto recording:', error);
@@ -202,7 +208,7 @@ class VoxtralChat {
                 this.silenceTimer = null;
             }
             
-            this.updateStatus('Processing detected speech...', 'processing');
+            this.updateStatus('Processing speech...', 'processing');
         }
     }
     
@@ -235,14 +241,18 @@ class VoxtralChat {
             const stream = await navigator.mediaDevices.getUserMedia({ 
                 audio: {
                     channelCount: 1,
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true
+                    echoCancellation: false,  // Preserve natural audio
+                    noiseSuppression: false,  // Preserve signal strength
+                    autoGainControl: false,   // Prevent automatic volume reduction
+                    volume: 1.0              // Maximum volume
                 } 
             });
             
-            // Check if the browser supports the preferred format
-            let options = { mimeType: 'audio/webm;codecs=opus' };
+            // Use higher quality settings for recording
+            let options = { 
+                mimeType: 'audio/webm;codecs=opus',
+                audioBitsPerSecond: 128000  // Higher bitrate for better quality
+            };
             if (!MediaRecorder.isTypeSupported(options.mimeType)) {
                 options = { mimeType: 'audio/webm' };
                 if (!MediaRecorder.isTypeSupported(options.mimeType)) {
@@ -276,7 +286,8 @@ class VoxtralChat {
             
             this.startBtn.disabled = true;
             this.stopBtn.disabled = false;
-            this.updateStatus('Recording... (speak now)', 'recording');
+            this.updateStatus('Recording... (speak LOUDLY)', 'recording');
+            this.addMessage('🔴 Recording started - Speak loudly and clearly!', 'info');
             
         } catch (error) {
             console.error('Error starting recording:', error);
@@ -289,9 +300,9 @@ class VoxtralChat {
         if (this.mediaRecorder && this.isRecording) {
             const recordingDuration = Date.now() - this.recordingStartTime;
             
-            // Check if recording is too short
-            if (recordingDuration < 500) {
-                this.addMessage('Recording too short. Please record for at least 1 second.', 'error');
+            // Increase minimum recording duration
+            if (recordingDuration < 2000) {
+                this.addMessage('Recording too short. Please record for at least 2-3 seconds and speak loudly.', 'error');
                 this.mediaRecorder.stop();
                 this.isRecording = false;
                 this.startBtn.disabled = false;
@@ -313,8 +324,8 @@ class VoxtralChat {
         console.log('Processing recording with', this.audioChunks.length, 'chunks');
         
         if (this.audioChunks.length === 0) {
-            this.addMessage('No audio data recorded. Please try again.', 'error');
-            this.updateStatus(this.isContinuousMode ? 'Continuous mode active - Speak anytime' : 'Ready');
+            this.addMessage('No audio data recorded. Please try again and speak louder.', 'error');
+            this.updateStatus(this.isContinuousMode ? 'Continuous mode active - Speak loudly' : 'Ready');
             return;
         }
         
@@ -325,9 +336,10 @@ class VoxtralChat {
         
         console.log('Audio blob created:', audioBlob.size, 'bytes, type:', audioBlob.type);
         
-        if (audioBlob.size < 1000) {
-            this.addMessage('Recording too small. Please speak louder and longer.', 'error');
-            this.updateStatus(this.isContinuousMode ? 'Continuous mode active - Speak anytime' : 'Ready');
+        // Increase minimum size requirement
+        if (audioBlob.size < 5000) {
+            this.addMessage('Recording too small. Please speak much louder and for longer duration.', 'error');
+            this.updateStatus(this.isContinuousMode ? 'Continuous mode active - Speak loudly' : 'Ready');
             return;
         }
         
@@ -340,15 +352,15 @@ class VoxtralChat {
                 this.sendAudio(base64Audio);
             } catch (error) {
                 console.error('Error processing audio blob:', error);
-                this.addMessage('Error processing audio. Please try again.', 'error');
-                this.updateStatus(this.isContinuousMode ? 'Continuous mode active - Speak anytime' : 'Ready');
+                this.addMessage('Error processing audio. Please try again and speak louder.', 'error');
+                this.updateStatus(this.isContinuousMode ? 'Continuous mode active - Speak loudly' : 'Ready');
             }
         };
         
         reader.onerror = () => {
             console.error('Error reading audio blob');
-            this.addMessage('Error reading audio. Please try again.', 'error');
-            this.updateStatus(this.isContinuousMode ? 'Continuous mode active - Speak anytime' : 'Ready');
+            this.addMessage('Error reading audio. Please try again and speak louder.', 'error');
+            this.updateStatus(this.isContinuousMode ? 'Continuous mode active - Speak loudly' : 'Ready');
         };
         
         reader.readAsDataURL(audioBlob);
@@ -372,7 +384,7 @@ class VoxtralChat {
         switch (data.type) {
             case 'response':
                 this.addMessage(data.text, 'assistant');
-                this.updateStatus(this.isContinuousMode ? 'Continuous mode active - Speak anytime' : 'Ready');
+                this.updateStatus(this.isContinuousMode ? 'Continuous mode active - Speak loudly' : 'Ready');
                 break;
                 
             case 'status':
@@ -381,7 +393,10 @@ class VoxtralChat {
                 
             case 'error':
                 this.addMessage(`Error: ${data.message}`, 'error');
-                this.updateStatus(this.isContinuousMode ? 'Continuous mode active - Speak anytime' : 'Ready');
+                if (data.message.includes('Audio content must be specified')) {
+                    this.addMessage('💡 Try speaking much LOUDER and closer to your microphone!', 'info');
+                }
+                this.updateStatus(this.isContinuousMode ? 'Continuous mode active - Speak loudly' : 'Ready');
                 break;
                 
             case 'pong':
