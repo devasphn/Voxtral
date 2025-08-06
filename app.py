@@ -118,42 +118,61 @@ async def process_audio(audio_data: bytes, client_id: str):
             
             logger.info(f"Audio processed: {len(audio_array)} samples, max amplitude: {np.max(np.abs(audio_array))}")
             
-            # FIXED: Proper conversation format for Voxtral
+            # CRITICAL FIX: Correct conversation format for Voxtral
             conversation = [
                 {
                     "role": "user",
                     "content": [
                         {
                             "type": "audio", 
-                            "audio": audio_array
+                            "audio": audio_array.tolist()  # Convert numpy array to list
                         }
                     ]
                 }
             ]
             
-            # Apply chat template with proper parameters
+            logger.info("Applying chat template...")
+            
+            # Apply chat template - FIXED: Remove return_dict parameter
             inputs = processor.apply_chat_template(
                 conversation, 
-                return_tensors="pt",
-                return_dict=True
+                return_tensors="pt"
             )
             
-            # Move inputs to device
-            inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+            logger.info(f"Template applied, inputs type: {type(inputs)}")
+            
+            # Move inputs to device properly
+            if isinstance(inputs, dict):
+                inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+            else:
+                inputs = inputs.to(device)
+            
+            logger.info("Generating response...")
             
             # Generate response
             with torch.no_grad():
-                outputs = model.generate(
-                    **inputs, 
-                    max_new_tokens=500, 
-                    temperature=0.7, 
-                    top_p=0.95,
-                    do_sample=True,
-                    pad_token_id=processor.tokenizer.eos_token_id
-                )
+                if isinstance(inputs, dict):
+                    outputs = model.generate(
+                        **inputs, 
+                        max_new_tokens=500, 
+                        temperature=0.7, 
+                        top_p=0.95,
+                        do_sample=True,
+                        pad_token_id=processor.tokenizer.eos_token_id
+                    )
+                    input_length = inputs["input_ids"].shape[1]
+                else:
+                    outputs = model.generate(
+                        inputs, 
+                        max_new_tokens=500, 
+                        temperature=0.7, 
+                        top_p=0.95,
+                        do_sample=True,
+                        pad_token_id=processor.tokenizer.eos_token_id
+                    )
+                    input_length = inputs.shape[1]
                 
                 # Get only the generated tokens (exclude input)
-                input_length = inputs["input_ids"].shape[1]
                 generated_tokens = outputs[:, input_length:]
                 
                 # Decode the response
@@ -161,6 +180,8 @@ async def process_audio(audio_data: bytes, client_id: str):
                     generated_tokens[0], 
                     skip_special_tokens=True
                 ).strip()
+                
+            logger.info(f"Generated response: {response_text}")
             
             if not response_text:
                 response_text = "I heard your audio but couldn't generate a response. Please try speaking more clearly."
@@ -185,6 +206,8 @@ async def process_audio(audio_data: bytes, client_id: str):
         })
     except Exception as e:
         logger.error(f"Error processing audio: {e}")
+        import traceback
+        traceback.print_exc()  # Print full traceback for debugging
         await manager.send_message(client_id, {
             "type": "error", 
             "message": f"Error processing audio: {str(e)}"
